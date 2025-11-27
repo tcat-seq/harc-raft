@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <!-- Property defaults; can be overridden via system properties or environment variables -->
+    <property name="LOG_LEVEL" value="${LOG_LEVEL:-INFO}"/>
+    <property name="LOG_DIR" value="${LOG_DIR:-./logs}"/>
+    <property name="LOG_FILE" value="${LOG_DIR}/app.log"/>
+    <property name="LOG_FILE_JSON" value="${LOG_DIR}/app-json.log"/>
+
+    <!-- CONSOLE APPENDER: Human-readable format for development -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss} %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- FILE APPENDER: Plain text rolling file for troubleshooting -->
+    <appender name="FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_FILE}</file>
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n</pattern>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/app-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <maxFileSize>10MB</maxFileSize>
+            <maxHistory>7</maxHistory>
+            <totalSizeCap>100MB</totalSizeCap>
+        </rollingPolicy>
+    </appender>
+
+    <!-- JSON FILE APPENDER: Structured JSON format for production/log aggregation -->
+    <appender name="FILE_JSON" class="ch.qos.logback.core.rolling.RollingFileAppender">
+        <file>${LOG_FILE_JSON}</file>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <includeMdcData>true</includeMdcData>
+            <includeContext>true</includeContext>
+            <writeVersion>false</writeVersion>
+        </encoder>
+        <rollingPolicy class="ch.qos.logback.core.rolling.SizeAndTimeBasedRollingPolicy">
+            <fileNamePattern>${LOG_DIR}/app-json-%d{yyyy-MM-dd}.%i.log</fileNamePattern>
+            <maxFileSize>10MB</maxFileSize>
+            <maxHistory>7</maxHistory>
+            <totalSizeCap>100MB</totalSizeCap>
+        </rollingPolicy>
+    </appender>
+
+    <!-- Per-package/module logger configurations -->
+    <!-- Application package: DEBUG level to capture development details -->
+    <logger name="com.havestonearc" level="DEBUG"/>
+
+    <!-- Third-party libraries: INFO level to reduce noise -->
+    <logger name="org.apache.maven" level="INFO"/>
+    <logger name="org.codehaus" level="INFO"/>
+    <logger name="org.slf4j" level="WARN"/>
+
+    <!-- Root logger: Console + File appenders (both plain text and JSON) -->
+    <root level="${LOG_LEVEL}">
+        <appender-ref ref="CONSOLE" />
+        <appender-ref ref="FILE" />
+        <appender-ref ref="FILE_JSON" />
+    </root>
+</configuration>
