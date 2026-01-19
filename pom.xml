@@ -10,14 +10,16 @@
 
   <name>harc-raft</name>
   <!-- FIXME change it to the project's website -->
-  <url>http://www.example.com</url>
+  <url/>
 
   <properties>
     <maven.compiler.source>25</maven.compiler.source>
     <maven.compiler.target>25</maven.compiler.target>
-    <aws.java.sdk.version>2.21.0</aws.java.sdk.version>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <aws.sdk.version>2.21.0</aws.sdk.version>
     <grpc.version>1.60.0</grpc.version>
     <protobuf.version>3.25.1</protobuf.version>
+    <slf4j.version>2.0.9</slf4j.version>
   </properties>
 
   <dependencyManagement>
@@ -25,7 +27,7 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>bom</artifactId>
-            <version>${aws.java.sdk.version}</version>
+            <version>${aws.sdk.version}</version>
             <type>pom</type>
             <scope>import</scope>
         </dependency>
@@ -46,12 +48,27 @@
         <artifactId>dynamodb</artifactId>
     </dependency>
 
-    <!-- SLF4J -->
+    <!-- Logging - SLF4J -->
     <dependency>
-        <groupId>org.slf4j</groupId>
-        <artifactId>slf4j-simple</artifactId>
-        <version>2.0.9</version>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${slf4j.version}</version>
     </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>${slf4j.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>ch.qos.logback</groupId>
+      <artifactId>logback-classic</artifactId>
+      <version>1.5.6</version>
+    </dependency>
+    <dependency>
+      <groupId>net.logstash.logback</groupId>
+      <artifactId>logstash-logback-encoder</artifactId>
+      <version>7.4</version>
+    </dependency>    
 
     <!-- gRPC & Protobuf -->
     <dependency>
@@ -69,38 +86,30 @@
         <artifactId>grpc-stub</artifactId>
         <version>${grpc.version}</version>
     </dependency>
-    <dependency> <!-- Necessary for Java 9+ -->
+    <!-- Java 9+ compatibility for gRPC-->
+    <dependency> 
         <groupId>org.apache.tomcat</groupId>
         <artifactId>annotations-api</artifactId>
         <version>6.0.53</version>
         <scope>provided</scope>
     </dependency>
 
-    <dependency>
-      <groupId>org.slf4j</groupId>
-      <artifactId>slf4j-api</artifactId>
-      <version>2.0.9</version>
-    </dependency>
-    <dependency>
-      <groupId>ch.qos.logback</groupId>
-      <artifactId>logback-classic</artifactId>
-      <version>1.5.6</version>
-    </dependency>
-    <dependency>
-      <groupId>net.logstash.logback</groupId>
-      <artifactId>logstash-logback-encoder</artifactId>
-      <version>7.4</version>
-    </dependency>    
-
+    <!-- Testing - JUnit 5 --> 
     <dependency>
       <groupId>org.junit.jupiter</groupId>
-      <artifactId>junit-jupiter-api</artifactId>
+      <artifactId>junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
     <!-- Optionally: parameterized tests support -->
     <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter-params</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.mockito</groupId>
+      <artifactId>mockito-core</artifactId>
+      <version>5.8.0</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
