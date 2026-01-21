@@ -14,8 +14,8 @@ import com.havenstone.raft.model.LogEntry;
  */
 public interface LogStorage {
 
-    int getCurrentTerm();
-    void setCurrentTerm(int term);
+    long getCurrentTerm();
+    void setCurrentTerm(long term);
 
     String getVotedFor();
     void setVotedFor(String candidateId);
