@@ -11,6 +11,7 @@ import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.havenstone.raft.model.AppendEntries;
 import com.havenstone.raft.model.RequestVote;
 import com.havenstone.raft.storage.LogStorage;
 import com.havenstone.raft.transport.NetworkTransport;
@@ -214,7 +215,92 @@ public class RaftNode {
     }
 
     private void sendHeartBeats() {
-        // TODO: Implement heartbeat logic
+        logger.debug("Leader {} sending heartbeats", nodeId)
+        
+        long term = storage.getCurrentTerm();
+
+        // NOTE: Focusing on empty hearbeats for now.
+        // In a full implementation, would also send log entries as needed.
+        for (String peerId : peerIds) {
+            executor.submit(() -> {
+                
+                // Construct AppendEntries instance with empty heartbeat entries for now.
+                // In a full implementation, would include log entries as needed.
+
+                // The purpose of prevLogIndex and prevLogTerm is to ensure log consistency
+                // during log replication (AppendEntries RPC), where the leader sends
+                // it to the follower to verify that the follower's log matches the 
+                // leader's log up to that specific point before appending new entries,
+                // ensuring that logs remain consistent across the servers in the cluster
+                // and preventing data loss or divergence.
+                // It tells the follower the index of the log entry just before the new 
+                // ones (prevLogIndex), requiring the follower to confirm both the index and its 
+                // associated term (prevLogTerm) match before accepting. 
+                // How it works:
+                // 1. Leader Sends: When a leader sends an AppendEntries RPC (or hearrbeat), 
+                //   it includes prevLogIndex (index of the log entry before the new ones) 
+                //   and prevLogTerm (the term of that entry) in the request.
+                // 2. Follower Validates: Upon receiving the AppendEntries RPC (or heartbeat), 
+                //   the follower checks: "Does my log contain an entry at prevLogIndex 
+                //   with term equal to prevLogTerm?"
+                // 3. Consistency Check:
+                //   - If Yes (Success): The follower's log is consistent with the leader's 
+                //     log up to that point. The follower can safely append the new entries
+                //     sent by the leader.
+                //   - If No (Failure): There is a log inconsistency. The follower rejects 
+                //     the AppendEntries RPC (or heartbeat) and does not append the new entries.
+                //     The leader will need to retry with earlier log entries until consistency is restored.
+                // 4. Log Repair: If inconsistencies are detected, the leader will decrement 
+                //    nextIndex for that follower and retry sending AppendEntries RPCs
+                //    (or heartbeats) with earlier log entries until the follower's log
+                //    matches the leader's log at prevLogIndex and prevLogTerm.
+                // 5. Continuing Replication: Once consistency is restored, the leader can
+                //    continue sending new log entries to the follower.
+                // This mechanism ensures that all followers' logs remain consistent with the leader's log,
+                // which is crucial for maintaining the integrity and reliability of the distributed system.
+                //
+                // For heartbeats with no new entries, these still need to be sent
+                // to maintain the log consistency checks.
+                long prevLogIndex = nextIndex.getOrDefault(peerId, 1L) - 1;
+                long prevLogTerm = (prevLogIndex == 0) ? 0 : storage.getEntry(prevLogIndex).term();
+                AppendEntries ae = new AppendEntries(
+                    term,
+                    this.nodeId,
+                    prevLogIndex,
+                    prevLogTerm,
+                    List.of(), // empty entries for heartbeat
+                    this.commitIndex
+                );
+
+                transport.sendAppendEntries(peerId, ae).thenAccept(response -> {
+                    lock.lock();
+                    try {
+                        // First check if still leader and term has not changed
+                        if (currentRole != Role.LEADER || storage.getCurrentTerm() != term) {
+                            // No longer a leader (stepped down) or term has changed
+                            return;
+                        }
+
+                        // Process response if still a leader
+                        // First check for higher term from peer in response.
+                        // If higher term, step down to follower
+                        if (response.term() > storage.getCurrentTerm()) {
+                            becomeFollower(response.term());
+                            return;
+                        }
+
+                        // For heartbeats, we don't need to update nextIndex/matchIndex
+                        // since no log entries are sent.
+                        // In a full implementation, would handle 
+                        // log replication here.
+
+                    } finally {
+                        lock.unlock();
+                    }
+                }); // end of transport.sendAppendEntries(...).thenAccept
+            }); // end of executor.submit for each peerId
+        } // end of for loop over peerIds
+
     }
 
 }
