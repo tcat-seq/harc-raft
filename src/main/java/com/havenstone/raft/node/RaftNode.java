@@ -5,11 +5,13 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.havenstone.raft.model.RequestVote;
 import com.havenstone.raft.storage.LogStorage;
 import com.havenstone.raft.transport.NetworkTransport;
 
@@ -67,6 +69,12 @@ public class RaftNode {
     }
 
 
+    /**
+     * Main loop for the Raft node.
+     * Handles role-specific actions such as sending heartbeats
+     * for leaders and starting elections for followers/candidates.
+     * Runs indefinitely in a Virtual Thread.
+     */
     private void runMainLoop() {
         while (true) {
             try {
@@ -99,11 +107,110 @@ public class RaftNode {
         }
     }
 
+    /**
+     * Starts a new election by transitioning to Candidate role,
+     * incrementing current term, voting for self, and broadcasting
+     * RequestVote RPCs to all peers asynchronously using Virtual Threads.
+     * 
+     */
     private void startElection() {
         logger.info("Election timeout reached. Node {} starting election", nodeId);
 
-        // TODO: Implement election logic
+        currentRole = Role.CANDIDATE;
+        storage.setCurrentTerm(storage.getCurrentTerm() + 1);
+        storage.setVotedFor(this.nodeId);
+        // reset timer
+        lastHeartbeatTime = System.currentTimeMillis();
 
+        long termAtElectionStart = storage.getCurrentTerm();
+        // Vote for self
+        AtomicLong votesReceived = new AtomicLong(1);
+
+        // Broadcast RequestVote in parallel using VTs to all peers
+        for (String peerId : peerIds) {
+            executor.submit(() -> {
+                RequestVote rv = new RequestVote(
+                    termAtElectionStart, 
+                    this.nodeId,
+                    storage.getLastIndex(),
+                    storage.getLastLogTerm()
+                );
+
+                transport.sendRequestVote(peerId, rv).thenAccept(response ->{
+                    lock.lock();
+                    try {
+                        // First check if still a candidate and term has not changed
+                        if (currentRole != Role.CANDIDATE || storage.getCurrentTerm() != termAtElectionStart) {
+                            // No longer a candidate (election is over) or term has changed
+                            return;
+                        }
+
+                        // Process response if still a candidate
+                        // First check for higher term from peer in response.
+                        // If higher term, step down to follower
+                        if (response.term() > storage.getCurrentTerm()) {
+                            becomeFollower(response.term());
+                            return;
+                        }
+
+                        // Process response.
+                        // If vote granted from peer response, increment vote count.
+                        // If majority reached, become Leader.
+                        // Majority is (N/2)+1 where N is total nodes including self.
+                        // Here, peerIds.size() + 1 accounts for self vote.
+                        // If total nodes is even, integer division handles floor automatically.
+                        // E.g., for 4 nodes, majority is (4/2)+1 = 3. For 5 nodes, (5/2)+1 = 3.
+                        // This ensures correct majority calculation for both even and odd cluster sizes.
+                        // If majority reached, transition to LEADER role and send initial heartbeats.
+                        if (response.voteGranted()) {
+                            long totalVotes = votesReceived.incrementAndGet();
+
+                            if (totalVotes > (peerIds.size() + 1) / 2) {
+                                becomeLeader();
+                            }
+                        }
+                    } finally {
+                        lock.unlock();
+                    }
+                }); // end of transport.sendRequestVote(...).thenAccept
+            }); // end of executor.submit for each peerId
+        } // end of for loop over peerIds
+
+    }
+
+    /**
+     * Transitions the node to Leader role after winning an election
+     * Sets up leader state and sends initial heartbeats.
+     * 
+     */
+    private void becomeLeader() {
+        // Won the election. Transition to Leader role.
+        currentRole = Role.LEADER;
+
+        // Reinitialize leader state
+        for (String pid : peerIds) {
+            nextIndex.put(pid, storage.getLastIndex() + 1);
+            matchIndex.put(pid, 0L);
+        }
+        logger.info("Node {} became LEADER for term {}", nodeId, storage.getCurrentTerm());
+
+        // Immediately send initial heartbeats
+        sendHeartBeats();
+    }
+
+    /**
+     * Steps down to follower role upon discovering a higher term
+     * 
+     * @param higherTerm - the higher term, discovered from a peer response
+     */
+    private void becomeFollower(long higherTerm) {
+        // Discovered higher term, step down to follower
+        storage.setCurrentTerm(higherTerm);
+        currentRole = Role.FOLLOWER;
+        storage.setVotedFor(null);
+        this.lastHeartbeatTime = System.currentTimeMillis();
+
+        logger.info("Node {} stepped down to FOLLOWER due to higher term {}", nodeId, higherTerm);
     }
 
     private void sendHeartBeats() {
