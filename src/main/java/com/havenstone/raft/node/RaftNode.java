@@ -12,7 +12,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.havenstone.raft.model.AppendEntries;
+import com.havenstone.raft.model.AppendEntriesResult;
 import com.havenstone.raft.model.RequestVote;
+import com.havenstone.raft.model.RequestVoteResult;
 import com.havenstone.raft.storage.LogStorage;
 import com.havenstone.raft.transport.NetworkTransport;
 
@@ -55,7 +57,11 @@ public class RaftNode {
         this.transport = transport;
         this.storage = storage;
         // Raft requires randomized election timeouts between 150ms and 300ms 
-        // to prevent split votes
+        // to prevent split votes. If two nodes wake up at the exact same time to
+        // become candidates, they may keep splitting votes indefinitely.
+        // Without randomness, this can lead to livelock. Randomization ensures
+        // one node times out slightly earlier, wins the election, and establishes 
+        // leadership.
         this.electionTimeoutMillis = 150 + (long)(Math.random() * 150); 
         this.lastHeartbeatTime = System.currentTimeMillis();
     }
@@ -66,6 +72,7 @@ public class RaftNode {
      */
     public void start() {
         executor.submit(this::runMainLoop);
+
         logger.info("Node {} started as FOLLOWER with timeout {}ms", nodeId, electionTimeoutMillis);
     }
 
@@ -200,7 +207,15 @@ public class RaftNode {
     }
 
     /**
-     * Steps down to follower role upon discovering a higher term
+     * Steps down to follower role upon discovering a higher term.
+     * 
+     * Term Logic:
+     * - Raft relies on currentTerm (a monotonically increasing integer). 
+     *   It acts as a logical clock to order events and ensure consistency.
+     * - Anytime a node discovers a term higher than its currentTerm, it must
+     *   immediately step down to follower role. This handles network partitions
+     *   where an old leader may still think it's the leader but other nodes 
+     * have moved on to a higher term.
      * 
      * @param higherTerm - the higher term, discovered from a peer response
      */
@@ -214,8 +229,31 @@ public class RaftNode {
         logger.info("Node {} stepped down to FOLLOWER due to higher term {}", nodeId, higherTerm);
     }
 
+    /**
+     * Send heartbeats (AppendEntries RPCs with no log entries for now) to all 
+     * peers asynchronously. In a full implementation, would also handle log 
+     * replication.
+     * 
+     * Heartbeats mechanism:
+     * - In Raft, the leader sends periodic heartbeats to all followers to
+     *  maintain its authority and prevent followers from starting new elections.
+     * It does this by sending AppendEntries RPCs with no log entries.
+     * - Heartbeats serve two main purposes:
+     * 1. Assert Leadership: By sending regular heartbeats, the leader
+     *    asserts its leadership over the cluster. Followers reset their election
+     *    timers (electionTimeoutMillis) upon receiving heartbeats, preventing them
+     *    from starting new elections.
+     * 2. Maintain Log Consistency: Even when there are no new log entries to 
+     *    replicate, heartbeats help ensure that followers' logs remain consistent
+     *    with the leader's log. This is crucial for maintaining the integrity of the 
+     *    distributed system.
+     *  
+     * 
+     * 
+     * 
+     */
     private void sendHeartBeats() {
-        logger.debug("Leader {} sending heartbeats", nodeId)
+        logger.debug("Leader {} sending heartbeats", nodeId);
         
         long term = storage.getCurrentTerm();
 
@@ -302,5 +340,127 @@ public class RaftNode {
         } // end of for loop over peerIds
 
     }
+
+
+    // --- RPC Handlers (called by NetworkTransport implementation) --- 
+
+    /**
+     * Handles incoming vote requests (RequestVote RPC) from Candidate.
+     * 
+     * Follows Raft voting rules to decide whether to grant the vote.
+     * 1. If the request's term is less than currentTerm, reject the vote.
+     * 2. If the request's term is greater than currentTerm, step down to
+     *    follower and consider the vote.
+     * 3. If haven't voted yet in this term (or voted for the requesting 
+     *    candidate), check if candidate's log is at least as up-to-date 
+     *    as receiver's log. 
+     *      If so, grant the vote.
+     * 4. Reset self election timer if vote granted.
+     *
+     * @param request - RequestVote RPC from candidate
+     * @return RequestVoteResult indicating whether vote was granted
+     */
+    public RequestVoteResult handleRequestVote(RequestVote request) {
+        lock.lock();
+        try {
+            long currentTerm = storage.getCurrentTerm();
+            boolean voteGranted = false;
+
+            // If request term is less than current term, reject vote
+            if (request.term() < currentTerm) {
+                logger.info("Node {} rejecting vote for {} due to lower term -  {} (Request Candidate Term) <  {} (Receiving Node Term)", 
+                    nodeId, request.candidateId(), request.term(), currentTerm);
+
+                return new RequestVoteResult(currentTerm, false);
+            }
+
+            // If request term is greater than current term, step down 
+            // to follower
+            if (request.term() > currentTerm) {
+                logger.info("Node {} stepping down to FOLLOWER due to higher term in RequestVote from {} (Request Candidate Node Id). {} (Request Candidate Term) >  {} (Receiving Node Term)", 
+                    nodeId, request.candidateId(), request.term(), currentTerm);
+
+                becomeFollower(request.term());
+                currentTerm = request.term();
+            }
+
+            // Check if already voted in this term (or if we have voted for 
+            // the requesting candidate)
+            String votedFor = storage.getVotedFor();
+            if (votedFor == null || votedFor.equals(request.candidateId())) {
+                // Check candidate's log is at least as up-to-date as receiver's log.
+                // See the comments in sendHeartBeats() for explanation of log consistency check.
+                long lastLogIndex = storage.getLastIndex();
+                long lastLogTerm = storage.getLastLogTerm();
+
+                // Request Candidate's log is at least as up-to-date as receiver's log
+                // if its last log term is greater than receiver's last log term,
+                // or if the terms are equal and candidate's last log index is
+                // greater than or equal to receiver's last log index.
+                // This ensures that votes are granted to candidates with
+                // the most complete logs, maintaining log consistency across the 
+                // cluster.
+                boolean isLogOk = (request.lastLogTerm() > lastLogTerm) ||
+                                (request.lastLogTerm() == lastLogTerm && request.lastLogIndex() >= lastLogIndex);
+
+                if (isLogOk) {
+                    // Grant vote
+                    storage.setVotedFor(request.candidateId());
+                    voteGranted = true;
+                    // Reset election timer
+                    lastHeartbeatTime = System.currentTimeMillis();
+                }
+            }
+
+            return new RequestVoteResult(currentTerm, voteGranted);
+
+        } finally {
+            lock.unlock();
+         }
+
+    }
+
+
+    public AppendEntriesResult handleAppendEntries(AppendEntries request) {
+        lock.lock();
+        try { 
+            long currentTerm = storage.getCurrentTerm();
+
+            // If request term is less than current term, reject append and 
+            // return current term so leader can update itself to higher term and
+            // step down if needed.
+            if (request.term() < currentTerm) {
+                logger.info("Node {} rejecting AppendEntries from {} (candidate) due to lower term.  {} (Request Leader Term) <  {} (Receiving Node Term)", 
+                    nodeId, request.leaderId(), request.term(), currentTerm);
+
+                return new AppendEntriesResult(currentTerm, false);
+            }
+
+            // If request term is greater than current term, step down 
+            // to follower
+            if (request.term() > currentTerm && currentRole != Role.FOLLOWER) {
+                logger.info("Node {} stepping down to FOLLOWER due to higher term in AppendEntries from {} (Request Leader Node Id). {} (Request Leader Term) >  {} (Receiving Node Term)", 
+                    nodeId, request.leaderId(), request.term(), currentTerm);
+
+                becomeFollower(request.term());
+                currentTerm = request.term();
+            }
+
+            // Reset election timer on receiving valid AppendEntries
+            lastHeartbeatTime = System.currentTimeMillis();
+
+            // For simplicity, not implementing full log consistency checks here.
+            // In a full implementation, would check prevLogIndex and prevLogTerm,
+            // append new entries, and update commitIndex as needed.
+            // TODO: Implement full log consistency checks and log replication.
+
+            return new AppendEntriesResult(currentTerm, true);
+
+        } finally {
+            lock.unlock();
+        }
+        
+    }
+
 
 }
