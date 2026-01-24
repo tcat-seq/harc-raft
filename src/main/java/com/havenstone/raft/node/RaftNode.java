@@ -2,6 +2,7 @@ package com.havenstone.raft.node;
 
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -13,6 +14,7 @@ import org.slf4j.LoggerFactory;
 
 import com.havenstone.raft.model.AppendEntries;
 import com.havenstone.raft.model.AppendEntriesResult;
+import com.havenstone.raft.model.LogEntry;
 import com.havenstone.raft.model.RequestVote;
 import com.havenstone.raft.model.RequestVoteResult;
 import com.havenstone.raft.storage.LogStorage;
@@ -40,7 +42,9 @@ public class RaftNode {
     private Role currentRole = Role.FOLLOWER;
 
     // Leader state (reinitialized after election)
+    // Index of the next log entry to send to a specific follower.
     private final Map<String, Long> nextIndex = new ConcurrentHashMap<>();
+    // Index of the highest log entry known to be replicated on a specific follower.
     private final Map<String, Long> matchIndex = new ConcurrentHashMap<>();
 
     // Election Timer state
@@ -95,7 +99,7 @@ public class RaftNode {
                     long currentTime = System.currentTimeMillis();
                     if (currentRole == Role.LEADER) {
                         // Leaders send heartbeats periodically
-                        sendHeartBeats();
+                        sendAppendEntriesToPeers();
                     } else {
                         // Followers and Candidates become candidates if election timeout elapses
                         if (currentTime - lastHeartbeatTime >= electionTimeoutMillis) {
@@ -203,7 +207,7 @@ public class RaftNode {
         logger.info("Node {} became LEADER for term {}", nodeId, storage.getCurrentTerm());
 
         // Immediately send initial heartbeats
-        sendHeartBeats();
+        sendAppendEntriesToPeers();
     }
 
     /**
@@ -252,7 +256,7 @@ public class RaftNode {
      * 
      * 
      */
-    private void sendHeartBeats() {
+    private void sendAppendEntriesToPeers() {
         logger.debug("Leader {} sending heartbeats", nodeId);
         
         long term = storage.getCurrentTerm();
@@ -477,5 +481,44 @@ public class RaftNode {
         
     }
 
+    public CompletableFuture<Boolean> submitCommand(String command) { 
+        
+        lock.lock();
+        try {
+            if (currentRole != Role.LEADER) {
+                // TODO: Return the leader's ID so client can redirect. This requires
+                // tracking the current leader which is not implemented yet.
+                logger.warn("Node {} cannot submit command as it is not the LEADER", nodeId);
+                return CompletableFuture.completedFuture(false);
+            } 
+
+            // 1. Append command as new log entry to local log
+
+            long term = storage.getCurrentTerm();
+            LogEntry entry = new LogEntry(term, command);
+            storage.appendEntries(List.of(entry));
+            logger.info("Leader {} appended entry {} to log at index {}", nodeId, command, storage.getLastIndex());
+
+            // 2. Immediately try to replicate log entry to followers
+            // TODO: In a full implementation, need to handle retries, failures, etc.
+            // For now, just send AppendEntries RPCs to followers. 
+            sendAppendEntriesToPeers();
+
+            // 3. For simplicity, assume entry is committed once appended locally.
+            // In a full implementation, would need to track replication status
+            // across followers and only commit once a majority have replicated.
+            // Update commitIndex and apply entry to state machine.
+            //      commitIndex = storage.getLastIndex();
+            //      applyLogEntries();
+            //      logger.info("Leader {} committed entry {} at index {}", nodeId, command, commitIndex);
+            // For now, just return success.
+
+            return CompletableFuture.completedFuture(true);
+
+        } finally {
+            lock.unlock();
+        }
+
+    }
 
 }
