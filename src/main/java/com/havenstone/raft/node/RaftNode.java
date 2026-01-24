@@ -420,7 +420,22 @@ public class RaftNode {
 
     }
 
-
+    /**
+     * Handles incoming AppendEntries RPCs from leader.
+     * Follows Raft rules for AppendEntries:
+     * 1. If request's term is less than currentTerm, reject the append.
+     * 2. If request's term is greater than currentTerm, step down to
+     *    follower.
+     * 3. Reset election timer on receiving valid AppendEntries.
+     * 4. Respond success if AppendEntries is valid (for simplicity,
+     *    not implementing full log consistency checks here).
+     * 5. (Not fully implemented) In a full implementation, would also
+     *    handle log consistency checks, appending new entries, and
+     *    updating commitIndex as needed.
+     * 
+     * @param request - AppendEntries RPC from leader
+     * @return AppendEntriesResult indicating success or failure
+     */
     public AppendEntriesResult handleAppendEntries(AppendEntries request) {
         lock.lock();
         try { 
