@@ -481,6 +481,17 @@ public class RaftNode {
         
     }
 
+    /**
+     * Submits a command to be appended to the log. 
+     * 
+     * Only the leader can accept commands. If not the leader, returns false.
+     * If leader, appends command as new log entry and attempts to replicate the 
+     * entry to followers.
+     * 
+     * 
+     * @param command - the command to append to the log
+     * @return CompletableFuture<Boolean> indicating success or failure
+     */
     public CompletableFuture<Boolean> submitCommand(String command) { 
         
         lock.lock();
