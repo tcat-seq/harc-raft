@@ -1,5 +1,6 @@
 package com.havenstone.raft.node;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -144,7 +145,7 @@ public class RaftNode {
                 RequestVote rv = new RequestVote(
                     termAtElectionStart, 
                     this.nodeId,
-                    storage.getLastIndex(),
+                    storage.getLastLogIndex(),
                     storage.getLastLogTerm()
                 );
 
@@ -201,7 +202,7 @@ public class RaftNode {
 
         // Reinitialize leader state
         for (String pid : peerIds) {
-            nextIndex.put(pid, storage.getLastIndex() + 1);
+            nextIndex.put(pid, storage.getLastLogIndex() + 1);
             matchIndex.put(pid, 0L);
         }
         logger.info("Node {} became LEADER for term {}", nodeId, storage.getCurrentTerm());
@@ -257,9 +258,9 @@ public class RaftNode {
      * 
      */
     private void sendAppendEntriesToPeers() {
-        logger.debug("Leader {} sending heartbeats", nodeId);
+        logger.debug("Leader {} sending append log entries / heartbeats", nodeId);
         
-        long term = storage.getCurrentTerm();
+        long currentTerm = storage.getCurrentTerm();
 
         // NOTE: Focusing on empty hearbeats for now.
         // In a full implementation, would also send log entries as needed.
@@ -279,7 +280,7 @@ public class RaftNode {
                 // ones (prevLogIndex), requiring the follower to confirm both the index and its 
                 // associated term (prevLogTerm) match before accepting. 
                 // How it works:
-                // 1. Leader Sends: When a leader sends an AppendEntries RPC (or hearrbeat), 
+                // 1. Leader Sends: When a leader sends an AppendEntries RPC (or heartbeat), 
                 //   it includes prevLogIndex (index of the log entry before the new ones) 
                 //   and prevLogTerm (the term of that entry) in the request.
                 // 2. Follower Validates: Upon receiving the AppendEntries RPC (or heartbeat), 
@@ -303,45 +304,163 @@ public class RaftNode {
                 //
                 // For heartbeats with no new entries, these still need to be sent
                 // to maintain the log consistency checks.
-                long prevLogIndex = nextIndex.getOrDefault(peerId, 1L) - 1;
-                long prevLogTerm = (prevLogIndex == 0) ? 0 : storage.getEntry(prevLogIndex).term();
-                AppendEntries ae = new AppendEntries(
-                    term,
+                long nextIdx = nextIndex.getOrDefault(peerId, 1L);
+                long prevLogIndex = nextIdx - 1;
+                long prevLogTerm = 0;
+
+                // Fetch the term of the prevLogIndex entry to allow followers to
+                // check for log consistency.
+                if (prevLogIndex > 0) {
+                    LogEntry prevEntry = storage.getEntry(prevLogIndex);
+                    if (prevEntry != null) {
+                        prevLogTerm = prevEntry.term();
+                    }
+                }
+
+                List<LogEntry> entriesToSend = getEntriesFromIndex(nextIdx);
+
+                AppendEntries request = new AppendEntries(
+                    currentTerm,
                     this.nodeId,
                     prevLogIndex,
                     prevLogTerm,
-                    List.of(), // empty entries for heartbeat
+                    entriesToSend, 
                     this.commitIndex
                 );
 
-                transport.sendAppendEntries(peerId, ae).thenAccept(response -> {
-                    lock.lock();
-                    try {
-                        // First check if still leader and term has not changed
-                        if (currentRole != Role.LEADER || storage.getCurrentTerm() != term) {
-                            // No longer a leader (stepped down) or term has changed
-                            return;
-                        }
-
-                        // Process response if still a leader
-                        // First check for higher term from peer in response.
-                        // If higher term, step down to follower
-                        if (response.term() > storage.getCurrentTerm()) {
-                            becomeFollower(response.term());
-                            return;
-                        }
-
-                        // For heartbeats, we don't need to update nextIndex/matchIndex
-                        // since no log entries are sent.
-                        // In a full implementation, would handle 
-                        // log replication here.
-
-                    } finally {
-                        lock.unlock();
-                    }
+                transport.sendAppendEntries(peerId, request).thenAccept(response -> {
+                    handleAppendEntriesResponse(peerId, response, entriesToSend.size());
                 }); // end of transport.sendAppendEntries(...).thenAccept
             }); // end of executor.submit for each peerId
         } // end of for loop over peerIds
+
+    }
+
+    /**
+     * Fetches log entries from storage starting from the given index
+     * 
+     * @param startIndex - index from which to fetch entries
+     * @return - list of LogEntry from startIndex to last index
+     */
+    private List<LogEntry> getEntriesFromIndex(long startIndex) {
+        List<LogEntry> entries = new ArrayList<>();
+        long lastIndex = storage.getLastLogIndex();
+        for (long i = startIndex; i <= lastIndex; i++) {
+            entries.add(storage.getEntry(i));
+        }
+
+        return entries;
+    }
+
+    /**
+     * Handles the response from a follower to an AppendEntries RPC.
+     * Updates nextIndex and matchIndex for the follower based on success or failure.
+     * 
+     * Logic:
+     * - If AppendEntries succeeded, update nextIndex and matchIndex for the follower.
+     * - If it failed due to log inconsistency, decrement nextIndex and retry.
+     * - Also checks for higher term in response to step down to follower if needed.
+     * 
+     * @param peer - the follower node ID
+     * @param response - the AppendEntriesResult from the follower
+     * @param numEntriesSent - number of log entries sent in the original AppendEntries RPC
+     */
+    private void handleAppendEntriesResponse(String peer, AppendEntriesResult response, int numEntriesSent) {
+        lock.lock();
+        try {
+            // First check if still leader
+            if (currentRole != Role.LEADER) {
+                // No longer a leader (stepped down) or term has changed
+                return;
+            }
+
+            // Process response if still a leader
+            // First check for higher term from peer in response.
+            // If higher term, step down to follower
+            if (response.term() > storage.getCurrentTerm()) {
+                becomeFollower(response.term());
+                return;
+            }
+
+            if (response.success()) {
+                // Replication succeeded.
+                // Update nextIndex and matchIndex for follower
+                long oldNextIndex = nextIndex.getOrDefault(peer, 1L);
+                long newNextIndex = oldNextIndex + numEntriesSent;
+
+                nextIndex.put(peer, newNextIndex);
+                matchIndex.put(peer, newNextIndex - 1);
+
+                // update commit Index
+                updateLeaderCommitIndex();
+            } else {
+                // AppendEntries failed due to log inconsistency.
+                // Decrement nextIndex and retry.
+                long currentNext = nextIndex.getOrDefault(peer, 1L);
+                long newNextIndex = Math.max(1, currentNext - 1);
+                nextIndex.put(peer, newNextIndex);
+
+                logger.warn("Leader {} AppendEntries to Follower {} failed due to log inconsistency. Decrementing nextIndex to {}", 
+                    nodeId, peer, newNextIndex);
+            }
+
+        } finally {
+            lock.unlock();
+        }
+
+    }
+
+    /**
+     * Updates the commitIndex on the leader based on matchIndex of followers.
+     * 
+     * Logic:
+     * - The leader maintains matchIndex for each follower, indicating the highest log entry
+     *   known to be replicated on that follower.
+     * - To update commitIndex, the leader checks for each log index N greater than current
+     *   commitIndex if a majority of matchIndex[i] >= N and log[N].term == currentTerm.
+     * - If so, it updates commitIndex to N.
+     * This ensures that only log entries from the current term are committed by the leader,
+     * maintaining log consistency.
+     * 
+     */
+    private void updateLeaderCommitIndex() {
+        long lastLogIndex = storage.getLastLogIndex();
+
+        // Check for each log index N greater than current commitIndex
+        // if a majority of matchIndex[i] >= N and log[N].term == currentTerm
+        // If so, update commitIndex to N
+        // This ensures that only log entries from the current term
+        // are committed by the leader, maintaining log consistency.
+        for (long N = lastLogIndex; N > commitIndex; N--) {
+
+            // Count how many servers have replicated log entry at index N
+            int replicatedCount = 1; // count self
+            for (String peerId : peerIds) {
+                if (matchIndex.getOrDefault(peerId, 0L) >= N) {
+                    replicatedCount++;
+                }
+            }
+
+            // If log entry at N has been replicated on majority of servers
+            // and is from current term, update commitIndex.
+            // Older entries from previous terms should not be committed
+            // by leader to prevent the "old log entry" issue described
+            // in the Raft paper. This ensures that only entries from
+            // the current term are committed, maintaining log consistency.
+            if (replicatedCount > (peerIds.size() + 1) / 2) {
+                LogEntry entry = storage.getEntry(N);
+                if (entry != null && entry.term() == storage.getCurrentTerm()) {
+                    commitIndex = N;
+
+                    // TODO: For now, we just log that the commit index has been updated.
+                    // In the Raft paper, this is where the leader would apply the 
+                    // committed entries to its state machine.
+                    logger.info("Leader {} updated commitIndex to {}", nodeId, commitIndex);
+
+                    break;
+                }
+            } // end of if replicatedCount > majority
+        } // end of for loop over N
 
     }
 
@@ -394,7 +513,7 @@ public class RaftNode {
             if (votedFor == null || votedFor.equals(request.candidateId())) {
                 // Check candidate's log is at least as up-to-date as receiver's log.
                 // See the comments in sendHeartBeats() for explanation of log consistency check.
-                long lastLogIndex = storage.getLastIndex();
+                long lastLogIndex = storage.getLastLogIndex();
                 long lastLogTerm = storage.getLastLogTerm();
 
                 // Request Candidate's log is at least as up-to-date as receiver's log
@@ -508,7 +627,7 @@ public class RaftNode {
             long term = storage.getCurrentTerm();
             LogEntry entry = new LogEntry(term, command);
             storage.appendEntries(List.of(entry));
-            logger.info("Leader {} appended entry {} to log at index {}", nodeId, command, storage.getLastIndex());
+            logger.info("Leader {} appended entry {} to log at index {}", nodeId, command, storage.getLastLogIndex());
 
             // 2. Immediately try to replicate log entry to followers
             // TODO: In a full implementation, need to handle retries, failures, etc.

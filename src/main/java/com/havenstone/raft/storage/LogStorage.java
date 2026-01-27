@@ -21,7 +21,7 @@ public interface LogStorage {
     void setVotedFor(String candidateId);
 
     LogEntry getEntry(long index);
-    long getLastIndex();
+    long getLastLogIndex();
     long getLastLogTerm();
 
     /**
