@@ -29,7 +29,7 @@ public interface NetworkTransport {
     CompletableFuture<RequestVoteResult> sendRequestVote(String peerId, RequestVote request);
 
     /**
-     * Sends an AppendEntries RPC to a specified peer.
+     * Sends an AppendEntries RPC (log replication or heartbeat) to a specified peer.
      * Use CompletableFuture to handle the response asynchronously on a Virtual Thread
      * 
      * @param peerId - ID of the peer to send the request to
