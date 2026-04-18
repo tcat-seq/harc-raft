@@ -25,8 +25,11 @@ public interface LogStorage {
     long getLastLogTerm();
 
     /**
+     * Abstraction for persistent storage.
      * Append new log entries to the log.
      * This should be transactional to ensure durability.
+     * Per Raft paper, Raft guarantees safety by persisting
+     * state before responding to RPCs.
      * 
      * @param entries - list of log entries to append
      */
